@@ -1,84 +1,151 @@
+<#
+.SYNOPSIS
+Given a list of AWS Control Catalog control ARNs, report which OUs have them enabled in AWS Control Tower.
+
+.PARAMETER ControlArnFile
+Path to a text file containing one Control Catalog ARN per line, e.g.:
+  arn:aws:controlcatalog:::control/XXXX
+#>
+
 param(
-    [Parameter(Mandatory=$true)]
+    [Parameter(Mandatory = $true)]
     [string]$ControlArnFile
 )
 
-Write-Host "Reading control ARNs from: $ControlArnFile" -ForegroundColor Cyan
+$ErrorActionPreference = 'Stop'
 
-# Read in the list of control catalog ARNs
-$controlArns = Get-Content -Path $ControlArnFile
+Write-Host "Reading catalog control ARNs from: $ControlArnFile" -ForegroundColor Cyan
+$inputCatalogArns = Get-Content -Path $ControlArnFile | Where-Object { $_ -and $_.Trim() -ne '' } | ForEach-Object { $_.Trim() } | Select-Object -Unique
 
-# Pull down list of all controls once (both types)
-$allControls = aws controltower list-controls --control-type PREVENTIVE | ConvertFrom-Json
-$detectiveControls = aws controltower list-controls --control-type DETECTIVE | ConvertFrom-Json
+# HashSet for O(1) lookups
+$catalogArnSet = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+$null = $inputCatalogArns | ForEach-Object { $catalogArnSet.Add($_) }
 
-$controlCatalog = @()
-$controlCatalog += $allControls.controls
-$controlCatalog += $detectiveControls.controls
+# --- Helper: enumerate all OUs recursively
+function Get-AllOUs {
+    $org = 'organizations'
 
-Write-Host "Loaded $(($controlCatalog).Count) controls from Control Tower catalog." -ForegroundColor Green
+    $roots = aws $org list-roots --output json | ConvertFrom-Json
+    $rootId = $roots.Roots[0].Id
 
-# Function to list all enabled controls for all OUs
-function Get-AllEnabledControls {
-    # First list all OUs under your AWS Organization
-    $orgOus = aws organizations list-organizational-units-for-parent `
-        --parent-id $(aws organizations list-roots --query "Roots[0].Id" --output text) `
-        | ConvertFrom-Json
+    $queue = @($rootId)
+    $allOus = @()
+
+    while ($queue.Count -gt 0) {
+        $parent = $queue[0]
+        $queue = $queue[1..($queue.Count - 1)] 2>$null
+
+        $nextToken = $null
+        do {
+            $cmd = @(
+                'organizations', 'list-organizational-units-for-parent',
+                '--parent-id', $parent,
+                '--output', 'json'
+            )
+            if ($nextToken) { $cmd += @('--starting-token', $nextToken) }
+
+            $resp = aws @cmd | ConvertFrom-Json
+            foreach ($ou in $resp.OrganizationalUnits) {
+                $allOus += $ou
+                # Also enumerate nested OUs
+                $queue += $ou.Id
+            }
+            $nextToken = $resp.NextToken
+        } while ($nextToken)
+    }
+
+    return $allOus
+}
+
+# --- Helper: list enabled controls for a given OU Id (handle pagination)
+function Get-EnabledControlsForOu {
+    param([Parameter(Mandatory)][string]$OuId)
 
     $enabled = @()
+    $nextToken = $null
 
-    foreach ($ou in $orgOus.OrganizationalUnits) {
-        Write-Host "Checking enabled controls for OU: $($ou.Name) ($($ou.Id))..."
+    # NOTE: Control Tower expects the OU *ARN* (targetIdentifier). We can derive it, but
+    # the CLI also accepts the OU ARN pattern as documented. Safest is to fetch the OU ARN from Organizations 'describe-organizational-unit'.
+    $ouDesc = aws organizations describe-organizational-unit --organizational-unit-id $OuId --output json | ConvertFrom-Json
+    $ouArn = $ouDesc.OrganizationalUnit.Arn
 
-        $result = aws controltower list-enabled-controls `
-            --target-identifier $ou.Id `
-            --target-type ORGANIZATIONAL_UNIT | ConvertFrom-Json
+    do {
+        $cmd = @(
+            'controltower', 'list-enabled-controls',
+            '--target-identifier', $ouArn,
+            '--output', 'json'
+        )
+        if ($nextToken) { $cmd += @('--starting-token', $nextToken) }
 
-        foreach ($ctrl in $result.enabledControls) {
-            $enabled += [PSCustomObject]@{
-                ControlIdentifier = $ctrl.controlIdentifier
-                ControlArn        = $ctrl.Arn
-                TargetOuName      = $ou.Name
-                TargetOuId        = $ou.Id
-            }
+        $resp = aws @cmd | ConvertFrom-Json
+        if ($resp.enabledControls) {
+            $enabled += $resp.enabledControls
         }
-    }
+        $nextToken = $resp.NextToken
+    } while ($nextToken)
 
     return $enabled
 }
 
-# Get all enabled controls once
-$enabledControls = Get-AllEnabledControls
+# --- Cache: map Control Tower controlIdentifier (regional controltower ARN) -> Control Catalog ARN
+$controlIdToCatalogArn = @{}
 
-Write-Host "`nSearching for matches..." -ForegroundColor Cyan
+function Get-CatalogArnFromControlIdentifier {
+    param([Parameter(Mandatory)][string]$ControlIdentifierArn)
 
-# Loop through each ARN provided by the user
-foreach ($catalogArn in $controlArns) {
-
-    Write-Host "`n=== Control Catalog ARN ===" -ForegroundColor Yellow
-    Write-Host $catalogArn -ForegroundColor Gray
-
-    # Map ARN → controlIdentifier
-    $control = $controlCatalog | Where-Object { $_.Arn -eq $catalogArn }
-
-    if (-not $control) {
-        Write-Host "No match found in catalog!" -ForegroundColor Red
-        continue
+    if ($controlIdToCatalogArn.ContainsKey($ControlIdentifierArn)) {
+        return $controlIdToCatalogArn[$ControlIdentifierArn]
     }
 
-    $identifier = $control.controlIdentifier
-    Write-Host "Control Identifier: $identifier" -ForegroundColor Green
+    # controlcatalog get-control accepts either a controltower or controlcatalog ARN and returns catalog ARN format
+    # Ref: AWS CLI 'aws controlcatalog get-control' docs
+    $gc = aws controlcatalog get-control --control-arn $ControlIdentifierArn --output json | ConvertFrom-Json
+    $catalogArn = $gc.Arn
+    $controlIdToCatalogArn[$ControlIdentifierArn] = $catalogArn
+    return $catalogArn
+}
 
-    # Find where this control is enabled
-    $matches = $enabledControls | Where-Object {
-        $_.ControlIdentifier -eq $identifier
-    }
+Write-Host "Enumerating Organizational Units..." -ForegroundColor Cyan
+$allOus = Get-AllOUs
 
-    if ($matches.Count -eq 0) {
-        Write-Host "Control NOT enabled anywhere." -ForegroundColor DarkYellow
-    }
-    else {
-        Write-Host "Enabled in the following OUs:" -ForegroundColor Cyan
-        $matches | Format-Table TargetOuName, TargetOuId, ControlIdentifier -AutoSize
+Write-Host ("Found {0} OUs. Scanning enabled controls..." -f $allOus.Count) -ForegroundColor Green
+
+$resultRows = New-Object System.Collections.Generic.List[object]
+
+foreach ($ou in $allOus) {
+    Write-Host ("OU: {0} ({1})" -f $ou.Name, $ou.Id) -ForegroundColor Yellow
+
+    $enabled = Get-EnabledControlsForOu -OuId $ou.Id
+
+    foreach ($ctrl in $enabled) {
+        # ctrl.controlIdentifier is a *regional* Control Tower ARN
+        $catalogArn = Get-CatalogArnFromControlIdentifier -ControlIdentifierArn $ctrl.controlIdentifier
+
+        if ($catalogArnSet.Contains($catalogArn)) {
+            $resultRows.Add([PSCustomObject]@{
+                    CatalogControlArn = $catalogArn
+                    ControlIdentifier = $ctrl.controlIdentifier
+                    EnabledControlArn = $ctrl.arn
+                    OUName            = $ou.Name
+                    OUId              = $ou.Id
+                    # Optional: include drift/status summaries if you want
+                    EnablementStatus  = $ctrl.statusSummary.status
+                    DriftStatus       = $ctrl.driftStatusSummary.driftStatus
+                })
+        }
     }
 }
+
+if ($resultRows.Count -eq 0) {
+    Write-Host "`nNo matches found: None of the provided catalog controls are currently enabled in any OU." -ForegroundColor DarkYellow
+}
+else {
+    Write-Host "`nMatches found:" -ForegroundColor Green
+    $resultRows | Sort-Object CatalogControlArn, OUName | Format-Table `
+        CatalogControlArn, OUName, OUId, EnablementStatus, DriftStatus -AutoSize
+}
+
+# Uncomment to export CSV:
+# $out = Join-Path -Path (Get-Location) -ChildPath ("controltower-enabled-from-catalog-{0:yyyyMMdd-HHmmss}.csv" -f (Get-Date))
+# $resultRows | Export-Csv -Path $out -NoTypeInformation -Encoding UTF8
+# Write-Host "CSV exported to: $out" -ForegroundColor Cyan
