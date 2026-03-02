@@ -1,0 +1,66 @@
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Sid": "AWSConfigPolicies",
+            "Effect": "Allow",
+            "Action": [
+                "config:PutConfigRule",
+                "config:PutOrganizationConfigRule",
+                "config:PutConformancePack",
+                "config:PutOrganizationConformancePack",
+                "config:DescribeConfigRules",
+                "config:DescribeOrganizationConfigRules",
+                "config:DescribeConformancePacks",
+                "config:DescribeOrganizationConformancePacks",
+                "config:DescribeConfigRuleEvaluationStatus",
+                "config:ListConfigRules",
+                "config:ListOrganizationConfigRules",
+                "config:ListConformancePacks",
+                "config:ListOrganizationConformancePacks"
+            ],
+            "Resource": "*"
+        },
+        {
+            "Sid": "ApplyPoliciesToOUs",
+            "Effect": "Allow",
+            "Action": [
+                "organizations:DescribeOrganization",
+                "organizations:ListParents",
+                "organizations:ListRoots",
+                "organizations:ListOrganizationalUnitsForParent",
+                "organizations:DescribeOrganizationalUnit",
+                "organizations:DescribePolicy",
+                "organizations:ListPolicies",
+                "organizations:ListPoliciesForTarget",
+                "organizations:AttachPolicy",
+                "organizations:DetachPolicy"
+            ],
+            "Resource": "*"
+        },
+        {
+            "Sid": "IAMUserAndRoleManagement",
+            "Effect": "Allow",
+            "Action": [
+                "iam:CreateUser",
+                "iam:CreateRole",
+                "iam:PutRolePolicy",
+                "iam:AttachRolePolicy",
+                "iam:AttachUserPolicy",
+                "iam:PutUserPolicy",
+                "iam:CreateAccessKey",
+                "iam:ListRoles",
+                "iam:ListUsers"
+            ],
+            "Resource": "*"
+        },
+        {
+            "Sid": "IAMPassRole",
+            "Effect": "Allow",
+            "Action": [
+                "iam:PassRole"
+            ],
+            "Resource": "*"
+        }
+    ]
+}
